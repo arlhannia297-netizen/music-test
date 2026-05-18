@@ -156,14 +156,22 @@
           </select>
         </div>
         <div>
-          <label for="pattern">Pattern strum</label>
+          <label for="pattern">Pattern</label>
           <select id="pattern">
-            <option value="D-DU-UDU" selected>D-DU-UDU (pop chuẩn)</option>
-            <option value="D-D-D-D-">D-D-D-D- (đơn giản)</option>
-            <option value="D-DUUDUDU">D-DUUDUDU (sôi động)</option>
-            <option value="D---D---">D---D--- (ballad chậm)</option>
-            <option value="DUDUDUDU">DUDUDUDU (đều liên tục)</option>
-            <option value="D-DU-UDU-DU-UDU-">2-bar D-DU-UDU x 2</option>
+            <optgroup label="Strum (quẹt)">
+              <option value="D-DU-UDU" selected>D-DU-UDU (pop chuẩn)</option>
+              <option value="D-D-D-D-">D-D-D-D- (đơn giản)</option>
+              <option value="D-DUUDUDU">D-DUUDUDU (sôi động)</option>
+              <option value="D---D---">D---D--- (ballad chậm)</option>
+              <option value="DUDUDUDU">DUDUDUDU (đều liên tục)</option>
+              <option value="D-DU-UDU-DU-UDU-">2-bar D-DU-UDU x 2</option>
+            </optgroup>
+            <optgroup label="Fingerpicking (gảy ngón)">
+              <option value="fp:travis">Travis picking (bass-thumb)</option>
+              <option value="fp:arpeggio">Arpeggio P-I-M-A (cổ điển)</option>
+              <option value="fp:ballad">Ballad chậm (bass + 3 dây)</option>
+              <option value="fp:waltz">Waltz 3/4 (P I M I)</option>
+            </optgroup>
           </select>
         </div>
       </div>
@@ -512,9 +520,104 @@ function scheduleStrum(ctx, dest, chordName, time, direction, velocity, sampleBa
 }
 
 // ===========================================================================
+// Schedule 1 cú gảy ngón (fingerpick) — chỉ phát 1 dây theo "vai trò"
+// ===========================================================================
+//   bass    -> dây trầm nhất chơi được
+//   altbass -> dây trầm thứ 2
+//   i       -> dây "ngón trỏ" (thường là dây G)
+//   m       -> dây "ngón giữa" (thường là dây B)
+//   a       -> dây "áp út" (thường là dây E cao)
+function scheduleFingerpick(ctx, dest, chordName, time, role, velocity, sampleBank) {
+  const notes = getChordMidiNotes(chordName);  // đã sắp từ trầm -> cao
+  if (notes.length === 0) return;
+
+  let idx;
+  switch (role) {
+    case "bass":    idx = 0; break;
+    case "altbass": idx = Math.min(1, notes.length - 1); break;
+    case "i":       idx = Math.max(0, notes.length - 3); break;
+    case "m":       idx = Math.max(0, notes.length - 2); break;
+    case "a":       idx = notes.length - 1; break;
+    default: idx = 0;
+  }
+  const midi = notes[idx];
+  const isBass = midi < 50;
+  // Single-pick: cho ngân lâu để các nốt chồng lên nhau tạo "vòng" hợp âm
+  const noteDuration = isBass ? 3.0 : 2.0;
+
+  const pan = notes.length > 1
+    ? (idx / (notes.length - 1) - 0.5) * 0.4
+    : 0;
+  let panNode;
+  if (typeof ctx.createStereoPanner === "function") {
+    panNode = ctx.createStereoPanner();
+    panNode.pan.value = pan;
+  } else {
+    panNode = ctx.createPanner();
+    panNode.panningModel = "equalpower";
+    panNode.setPosition(pan, 0, 1 - Math.abs(pan));
+  }
+
+  // Bass nổi hơn ngón i/m/a 1 chút (đặc trưng fingerstyle)
+  const noteVel = (role === "bass" || role === "altbass")
+    ? velocity * 0.95
+    : velocity * 0.78;
+
+  const inter = ctx.createGain();
+  inter.connect(panNode);
+  panNode.connect(dest);
+  scheduleNote(ctx, inter, midi, time, noteDuration, noteVel, sampleBank);
+}
+
+// ===========================================================================
+// Pattern fingerpicking — định nghĩa theo (beatOffset, role)
+// ===========================================================================
+const FP_PATTERNS = {
+  "fp:travis": {
+    beatsPerBar: 4,
+    events: [
+      [0.0, "bass"],    [0.5, "i"],
+      [1.0, "altbass"], [1.5, "m"],
+      [2.0, "bass"],    [2.5, "i"],
+      [3.0, "altbass"], [3.5, "m"],
+    ],
+  },
+  "fp:arpeggio": {
+    beatsPerBar: 4,
+    events: [
+      [0.0, "bass"], [0.5, "i"], [1.0, "m"], [1.5, "a"],
+      [2.0, "m"],    [2.5, "i"], [3.0, "m"], [3.5, "a"],
+    ],
+  },
+  "fp:ballad": {
+    // Bass + 3 dây cao cùng lúc, mỗi 2 phách
+    beatsPerBar: 4,
+    events: [
+      [0.0, "bass"], [0.0, "i"], [0.0, "m"], [0.0, "a"],
+      [2.0, "bass"], [2.0, "i"], [2.0, "m"], [2.0, "a"],
+    ],
+  },
+  "fp:waltz": {
+    // 3/4 cổ điển: P - I - M
+    beatsPerBar: 3,
+    events: [
+      [0.0, "bass"], [1.0, "i"], [2.0, "m"],
+    ],
+  },
+};
+
+// ===========================================================================
 // Pattern parser
 // ===========================================================================
 function parsePattern(pattern) {
+  // Fingerpicking pattern -> trả lại trực tiếp
+  if (pattern.startsWith("fp:")) {
+    const fp = FP_PATTERNS[pattern];
+    if (!fp) throw new Error("Pattern fingerpicking không tồn tại: " + pattern);
+    return { kind: "fp", events: fp.events, beatsPerBar: fp.beatsPerBar };
+  }
+
+  // Strum pattern: D/U/-/.
   const events = [];
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
@@ -525,7 +628,7 @@ function parsePattern(pattern) {
     else throw new Error(`Pattern ký tự không hợp lệ: '${ch}'`);
   }
   if (events.length === 0) events.push([0, "D"]);
-  return events;
+  return { kind: "strum", events: events, beatsPerBar: null };
 }
 
 // ===========================================================================
@@ -555,10 +658,14 @@ function makeIR(ctx, durationSec, decay, predelay) {
 // ===========================================================================
 async function renderOffline(chords, opts, sampleRate, sampleBank) {
   const { bpm, barsPerChord, beatsPerBar, pattern, tone, reverb, engine } = opts;
+  const parsed = parsePattern(pattern);
+
+  // Fingerpicking pattern có nhịp riêng (vd waltz 3/4 -> beatsPerBar=3)
+  const effectiveBeatsPerBar = parsed.beatsPerBar || beatsPerBar;
+
   const secPerBeat = 60 / bpm;
-  const secPerChord = secPerBeat * beatsPerBar * barsPerChord;
-  const events = parsePattern(pattern);
-  const patternLenBeats = beatsPerBar * barsPerChord;
+  const secPerChord = secPerBeat * effectiveBeatsPerBar * barsPerChord;
+  const patternLenBeats = effectiveBeatsPerBar * barsPerChord;
 
   const tailSec = reverb >= 3 ? 3.5 : reverb >= 2 ? 2.5 : reverb >= 1 ? 1.8 : 1.0;
   const totalSec = secPerChord * chords.length + tailSec;
@@ -632,12 +739,19 @@ async function renderOffline(chords, opts, sampleRate, sampleBank) {
   // Schedule
   for (let ci = 0; ci < chords.length; ci++) {
     const chordStart = ci * secPerChord;
-    for (const [beatOffset, dir] of events) {
+    for (const ev of parsed.events) {
+      const beatOffset = ev[0];
+      const what = ev[1];
       const wrapped = beatOffset % patternLenBeats;
       const t = chordStart + wrapped * secPerBeat;
-      const tJitter = (Math.random() - 0.5) * 0.012;
+      // Fingerpicking ít jitter hơn strum (gảy ngón chính xác)
+      const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
       const vel = 0.85 + Math.random() * 0.15;
-      scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, dir, vel, sampleBank);
+      if (parsed.kind === "fp") {
+        scheduleFingerpick(ctx, inputBus, chords[ci], t + tJitter, what, vel, sampleBank);
+      } else {
+        scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, what, vel, sampleBank);
+      }
     }
   }
 
@@ -767,7 +881,9 @@ function clearHighlights() {
 }
 
 function secPerChordOf(opts) {
-  return (60 / opts.bpm) * opts.beatsPerBar * opts.barsPerChord;
+  const parsed = parsePattern(opts.pattern);
+  const bpb = parsed.beatsPerBar || opts.beatsPerBar;
+  return (60 / opts.bpm) * bpb * opts.barsPerChord;
 }
 
 async function ensureBank(opts) {
