@@ -504,6 +504,8 @@ function makeKarplusStrongBuffer(ctx, freq, durationSec) {
 // ===========================================================================
 // Schedule 1 nốt — đa engine
 // ===========================================================================
+// Đã được tinh giản: bỏ Gain "inter" thừa và để caller tự quản lý panner.
+// Chỉ tạo 1 BufferSource + 1 GainNode envelope cho mỗi nốt -> ít node hơn rất nhiều.
 function scheduleNote(ctx, dest, midi, time, duration, velocity, sampleBank) {
   const src = ctx.createBufferSource();
 
@@ -533,50 +535,67 @@ function scheduleNote(ctx, dest, midi, time, duration, velocity, sampleBank) {
   src.stop(stopTime + 0.05);
 }
 
+// Tạo 6 panner cố định (theo string position) gắn vào 1 dest, cache lại để tái sử dụng.
+// Trước đây mỗi nốt tạo mới 1 StereoPanner -> với bài 4-5 phút có hàng nghìn panner thừa.
+function createStringPanners(ctx, dest) {
+  const panners = [];
+  for (let i = 0; i < 6; i++) {
+    const pan = (i / 5 - 0.5) * 0.4;  // 6 dây trải đều từ -0.2 (trầm/trái) -> +0.2 (cao/phải)
+    let p;
+    if (typeof ctx.createStereoPanner === "function") {
+      p = ctx.createStereoPanner();
+      p.pan.value = pan;
+    } else {
+      p = ctx.createPanner();
+      p.panningModel = "equalpower";
+      p.setPosition(pan, 0, 1 - Math.abs(pan));
+    }
+    p.connect(dest);
+    panners.push(p);
+  }
+  return panners;
+}
+
 // ===========================================================================
 // Schedule 1 cú strum
 // ===========================================================================
-function scheduleStrum(ctx, dest, chordName, time, direction, velocity, sampleBank) {
-  let notes = getChordMidiNotes(chordName);
-  if (direction === "U") notes = notes.slice().reverse();
+// `panners`: mảng 6 StereoPanner cố định (theo string position 0..5 = trầm..cao).
+// `noteDurationBass` / `noteDurationTreble`: thời lượng ngân (đã tính theo BPM).
+function scheduleStrum(ctx, panners, chordName, time, direction, velocity, sampleBank,
+                       noteDurationBass, noteDurationTreble) {
+  const shape = CHORD_SHAPES[chordName];
+  if (!shape) throw new Error(`Hợp âm '${chordName}' chưa hỗ trợ`);
+
+  // Lấy notes kèm string-index gốc (0..5) để gắn panner cố định.
+  // shape index 0 = dây 6 (trầm) ... 5 = dây 1 (cao).
+  const playable = [];
+  for (let i = 0; i < shape.length; i++) {
+    if (shape[i] !== null) playable.push({ midi: STRING_BASE_MIDI[i] + shape[i], stringIdx: i });
+  }
+  if (playable.length === 0) return;
+
+  // Down: chơi từ trầm -> cao (string index tăng dần)
+  // Up:   chơi từ cao -> trầm (đảo lại)
+  if (direction === "U") playable.reverse();
 
   const strumSpread = direction === "D" ? 0.022 : 0.013;
-  const perStringDelay = notes.length > 1 ? strumSpread / (notes.length - 1) : 0;
+  const perStringDelay = playable.length > 1 ? strumSpread / (playable.length - 1) : 0;
 
-  for (let i = 0; i < notes.length; i++) {
-    const midi = notes[i];
+  for (let i = 0; i < playable.length; i++) {
+    const { midi, stringIdx } = playable[i];
     const stringJitter = (Math.random() - 0.5) * 0.0015;
     const startTime = Math.max(0, time + i * perStringDelay + stringJitter);
 
     const isBass = midi < 50;
-    // Sample đã có decay tự nhiên — chỉ cần thời lượng đủ dài
-    const noteDuration = direction === "U" ? 0.9 : (isBass ? 2.6 : 2.0);
-
-    // Pan: trầm hơi trái, cao hơi phải (mic 1 cây acoustic)
-    const stringPos = direction === "D" ? i : (notes.length - 1 - i);
-    const pan = notes.length > 1
-      ? (stringPos / (notes.length - 1) - 0.5) * 0.4
-      : 0;
-
-    let panNode;
-    if (typeof ctx.createStereoPanner === "function") {
-      panNode = ctx.createStereoPanner();
-      panNode.pan.value = pan;
-    } else {
-      panNode = ctx.createPanner();
-      panNode.panningModel = "equalpower";
-      panNode.setPosition(pan, 0, 1 - Math.abs(pan));
-    }
+    const noteDuration = direction === "U"
+      ? Math.min(noteDurationTreble, 1.1)        // up-strum ngắn hơn tự nhiên
+      : (isBass ? noteDurationBass : noteDurationTreble);
 
     const noteVel = direction === "D"
       ? velocity * (0.78 + 0.04 * i)
       : velocity * 0.62 * (1.0 - 0.05 * i);
 
-    // Tách thành 2 stage: scheduleNote -> panNode -> dest
-    const inter = ctx.createGain();
-    inter.connect(panNode);
-    panNode.connect(dest);
-    scheduleNote(ctx, inter, midi, startTime, noteDuration, noteVel, sampleBank);
+    scheduleNote(ctx, panners[stringIdx], midi, startTime, noteDuration, noteVel, sampleBank);
   }
 }
 
@@ -588,46 +607,39 @@ function scheduleStrum(ctx, dest, chordName, time, direction, velocity, sampleBa
 //   i       -> dây "ngón trỏ" (thường là dây G)
 //   m       -> dây "ngón giữa" (thường là dây B)
 //   a       -> dây "áp út" (thường là dây E cao)
-function scheduleFingerpick(ctx, dest, chordName, time, role, velocity, sampleBank) {
-  const notes = getChordMidiNotes(chordName);  // đã sắp từ trầm -> cao
-  if (notes.length === 0) return;
+function scheduleFingerpick(ctx, panners, chordName, time, role, velocity, sampleBank,
+                            noteDurationBass, noteDurationTreble) {
+  const shape = CHORD_SHAPES[chordName];
+  if (!shape) throw new Error(`Hợp âm '${chordName}' chưa hỗ trợ`);
+
+  const playable = [];
+  for (let i = 0; i < shape.length; i++) {
+    if (shape[i] !== null) playable.push({ midi: STRING_BASE_MIDI[i] + shape[i], stringIdx: i });
+  }
+  if (playable.length === 0) return;
 
   let idx;
   switch (role) {
     case "bass":    idx = 0; break;
-    case "altbass": idx = Math.min(1, notes.length - 1); break;
-    case "i":       idx = Math.max(0, notes.length - 3); break;
-    case "m":       idx = Math.max(0, notes.length - 2); break;
-    case "a":       idx = notes.length - 1; break;
+    case "altbass": idx = Math.min(1, playable.length - 1); break;
+    case "i":       idx = Math.max(0, playable.length - 3); break;
+    case "m":       idx = Math.max(0, playable.length - 2); break;
+    case "a":       idx = playable.length - 1; break;
     default: idx = 0;
   }
-  const midi = notes[idx];
+  const { midi, stringIdx } = playable[idx];
   const isBass = midi < 50;
-  // Single-pick: cho ngân lâu để các nốt chồng lên nhau tạo "vòng" hợp âm
-  const noteDuration = isBass ? 3.0 : 2.0;
+  // Single-pick cần ngân lâu hơn để các nốt chồng tạo "vòng" hợp âm,
+  // nhưng vẫn cap theo BPM để không kéo lê quá đà.
+  const noteDuration = isBass
+    ? Math.max(noteDurationBass, 1.6)
+    : Math.max(noteDurationTreble, 1.3);
 
-  const pan = notes.length > 1
-    ? (idx / (notes.length - 1) - 0.5) * 0.4
-    : 0;
-  let panNode;
-  if (typeof ctx.createStereoPanner === "function") {
-    panNode = ctx.createStereoPanner();
-    panNode.pan.value = pan;
-  } else {
-    panNode = ctx.createPanner();
-    panNode.panningModel = "equalpower";
-    panNode.setPosition(pan, 0, 1 - Math.abs(pan));
-  }
-
-  // Bass nổi hơn ngón i/m/a 1 chút (đặc trưng fingerstyle)
   const noteVel = (role === "bass" || role === "altbass")
     ? velocity * 0.95
     : velocity * 0.78;
 
-  const inter = ctx.createGain();
-  inter.connect(panNode);
-  panNode.connect(dest);
-  scheduleNote(ctx, inter, midi, time, noteDuration, noteVel, sampleBank);
+  scheduleNote(ctx, panners[stringIdx], midi, time, noteDuration, noteVel, sampleBank);
 }
 
 // ===========================================================================
@@ -726,7 +738,6 @@ async function renderOffline(chords, opts, sampleRate, sampleBank) {
 
   const secPerBeat = 60 / bpm;
   const secPerChord = secPerBeat * effectiveBeatsPerBar * barsPerChord;
-  const patternLenBeats = effectiveBeatsPerBar * barsPerChord;
 
   const tailSec = reverb >= 3 ? 3.5 : reverb >= 2 ? 2.5 : reverb >= 1 ? 1.8 : 1.0;
   const totalSec = secPerChord * chords.length + tailSec;
@@ -797,21 +808,44 @@ async function renderOffline(chords, opts, sampleRate, sampleBank) {
   }
   master.connect(ctx.destination);
 
+  // Cache 6 panner cố định (theo dây) gắn vào inputBus
+  const panners = createStringPanners(ctx, inputBus);
+
+  // Adaptive note duration theo BPM: ngân ~3.5 phách là đủ overlap, BPM cao thì tự ngắn.
+  const noteDurationBass = Math.min(2.6, Math.max(secPerBeat * 4.0, 1.0));
+  const noteDurationTreble = Math.min(2.0, Math.max(secPerBeat * 3.0, 0.8));
+
   // Schedule
+  // FIX BUG Ô NHỊP: pattern user có thể dài 1 bar HOẶC nhiều bar.
+  // Trước đây code chỉ play pattern 1 lần ở đầu hợp âm -> các bar sau trống.
+  // Giờ tính độ dài pattern theo beats, lặp đủ để phủ hết chord-window.
+  const maxBeatInPattern = parsed.events.length
+    ? Math.max(...parsed.events.map((e) => e[0]))
+    : 0;
+  const patternBars = Math.max(1, Math.ceil((maxBeatInPattern + 0.5) / effectiveBeatsPerBar));
+  const patternRepeats = Math.max(1, Math.ceil(barsPerChord / patternBars));
+  const patternSpanBeats = patternBars * effectiveBeatsPerBar;
+
   for (let ci = 0; ci < chords.length; ci++) {
     const chordStart = ci * secPerChord;
-    for (const ev of parsed.events) {
-      const beatOffset = ev[0];
-      const what = ev[1];
-      const wrapped = beatOffset % patternLenBeats;
-      const t = chordStart + wrapped * secPerBeat;
-      // Fingerpicking ít jitter hơn strum (gảy ngón chính xác)
-      const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
-      const vel = 0.85 + Math.random() * 0.15;
-      if (parsed.kind === "fp") {
-        scheduleFingerpick(ctx, inputBus, chords[ci], t + tJitter, what, vel, sampleBank);
-      } else {
-        scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, what, vel, sampleBank);
+    for (let rep = 0; rep < patternRepeats; rep++) {
+      const repStart = chordStart + rep * patternSpanBeats * secPerBeat;
+      if (repStart >= chordStart + secPerChord) break;
+      for (const ev of parsed.events) {
+        const beatOffset = ev[0];
+        const what = ev[1];
+        const t = repStart + beatOffset * secPerBeat;
+        if (t >= chordStart + secPerChord) continue;
+        // Fingerpicking ít jitter hơn strum (gảy ngón chính xác)
+        const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
+        const vel = 0.85 + Math.random() * 0.15;
+        if (parsed.kind === "fp") {
+          scheduleFingerpick(ctx, panners, chords[ci], t + tJitter, what, vel, sampleBank,
+                             noteDurationBass, noteDurationTreble);
+        } else {
+          scheduleStrum(ctx, panners, chords[ci], t + tJitter, what, vel, sampleBank,
+                        noteDurationBass, noteDurationTreble);
+        }
       }
     }
   }
@@ -1422,13 +1456,22 @@ async function renderSongOffline(song, globalOpts, sampleRate, sampleBank) {
   }
   master.connect(ctx.destination);
 
+  // Cache 6 panner cố định gắn vào inputBus
+  const panners = createStringPanners(ctx, inputBus);
+
   // Schedule từng section nối tiếp
   let sectionStart = 0;
   for (const t of sectionTimings) {
-    const { sec, parsed, secPerBeat, secPerChord } = t;
+    const { sec, parsed, secPerBeat, secPerChord, bpb } = t;
     const sectionGain = ctx.createGain();
     sectionGain.gain.value = (sec.volPct / 100);
+    // Nối section gain vào TRƯỚC panners để giữ stereo image; tạo riêng panner cho section.
+    const sectionPanners = createStringPanners(ctx, sectionGain);
     sectionGain.connect(inputBus);
+
+    // Adaptive note duration theo BPM của section này
+    const noteDurationBass = Math.min(2.6, Math.max(secPerBeat * 4.0, 1.0));
+    const noteDurationTreble = Math.min(2.0, Math.max(secPerBeat * 3.0, 0.8));
 
     for (let ci = 0; ci < sec.chords.length; ci++) {
       const chordRaw = sec.chords[ci];
@@ -1436,16 +1479,31 @@ async function renderSongOffline(song, globalOpts, sampleRate, sampleBank) {
       if (!chordName) continue;  // bỏ chord không hỗ trợ
 
       const chordStart = sectionStart + ci * secPerChord;
-      for (const ev of parsed.events) {
-        const beatOffset = ev[0];
-        const what = ev[1];
-        const tBeat = chordStart + beatOffset * secPerBeat;
-        const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
-        const vel = 0.85 + Math.random() * 0.15;
-        if (parsed.kind === "fp") {
-          scheduleFingerpick(ctx, sectionGain, chordName, tBeat + tJitter, what, vel, sampleBank);
-        } else {
-          scheduleStrum(ctx, sectionGain, chordName, tBeat + tJitter, what, vel, sampleBank);
+      // FIX BUG Ô NHỊP: lặp pattern đủ để phủ hết chord-window
+      const maxBeatInPattern = parsed.events.length
+        ? Math.max(...parsed.events.map((e) => e[0]))
+        : 0;
+      const patternBars = Math.max(1, Math.ceil((maxBeatInPattern + 0.5) / bpb));
+      const patternRepeats = Math.max(1, Math.ceil(barsPerChord / patternBars));
+      const patternSpanBeats = patternBars * bpb;
+
+      for (let rep = 0; rep < patternRepeats; rep++) {
+        const repStart = chordStart + rep * patternSpanBeats * secPerBeat;
+        if (repStart >= chordStart + secPerChord) break;
+        for (const ev of parsed.events) {
+          const beatOffset = ev[0];
+          const what = ev[1];
+          const tBeat = repStart + beatOffset * secPerBeat;
+          if (tBeat >= chordStart + secPerChord) continue;
+          const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
+          const vel = 0.85 + Math.random() * 0.15;
+          if (parsed.kind === "fp") {
+            scheduleFingerpick(ctx, sectionPanners, chordName, tBeat + tJitter, what, vel,
+                               sampleBank, noteDurationBass, noteDurationTreble);
+          } else {
+            scheduleStrum(ctx, sectionPanners, chordName, tBeat + tJitter, what, vel,
+                          sampleBank, noteDurationBass, noteDurationTreble);
+          }
         }
       }
     }
