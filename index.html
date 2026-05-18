@@ -722,13 +722,20 @@ const FP_PATTERNS = {
 // ===========================================================================
 function parsePattern(pattern) {
   // Fingerpicking pattern -> trả lại trực tiếp
+  // patternBeats = độ dài 1 chu kỳ pattern (tính bằng beat). FP pattern lặp mỗi
+  // beatsPerBar (vd Travis = 4 beats, Waltz = 3 beats).
   if (pattern.startsWith("fp:")) {
     const fp = FP_PATTERNS[pattern];
     if (!fp) throw new Error("Pattern fingerpicking không tồn tại: " + pattern);
-    return { kind: "fp", events: fp.events, beatsPerBar: fp.beatsPerBar };
+    return {
+      kind: "fp",
+      events: fp.events,
+      beatsPerBar: fp.beatsPerBar,
+      patternBeats: fp.beatsPerBar,
+    };
   }
 
-  // Strum pattern: D/U/-/.
+  // Strum pattern: D/U/-/. — mỗi ký tự = 1/8 nốt = 0.5 beat
   const events = [];
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
@@ -739,7 +746,11 @@ function parsePattern(pattern) {
     else throw new Error(`Pattern ký tự không hợp lệ: '${ch}'`);
   }
   if (events.length === 0) events.push([0, "D"]);
-  return { kind: "strum", events: events, beatsPerBar: null };
+  // Tổng độ dài pattern (kể cả các ký tự nghỉ ở cuối)
+  // Vd "D-DU-UDU" (8 chars) = 4 beats = 1 bar 4/4
+  // Vd "D-DU-UDU-DU-UDU-" (16 chars) = 8 beats = 2 bar
+  const patternBeats = Math.max(1, pattern.length / 2);
+  return { kind: "strum", events: events, beatsPerBar: null, patternBeats: patternBeats };
 }
 
 // ===========================================================================
@@ -847,21 +858,42 @@ async function renderOffline(chords, opts, sampleRate, sampleBank) {
   }
   master.connect(ctx.destination);
 
-  // Schedule
+  // Schedule — lặp pattern qua các bar trong chord
+  // Vd pattern "D---D---" dài 4 beats. Nếu chord = 2 ô nhịp (8 beats), pattern
+  // phải chơi 2 lần liên tiếp. Trước đây dùng "wrapped = beatOffset % patternLenBeats"
+  // không hoạt động vì các event chỉ ở beat 0,2 -> wrap 0,2 -> chỉ chơi nửa đầu.
+  const chordBeats = effectiveBeatsPerBar * barsPerChord;
+  const patternBeats = parsed.patternBeats || effectiveBeatsPerBar;
   for (let ci = 0; ci < chords.length; ci++) {
     const chordStart = ci * secPerChord;
-    for (const ev of parsed.events) {
-      const beatOffset = ev[0];
-      const what = ev[1];
-      const wrapped = beatOffset % patternLenBeats;
-      const t = chordStart + wrapped * secPerBeat;
-      // Fingerpicking ít jitter hơn strum (gảy ngón chính xác)
-      const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
-      const vel = 0.85 + Math.random() * 0.15;
-      if (parsed.kind === "fp") {
-        scheduleFingerpick(ctx, inputBus, chords[ci], t + tJitter, what, vel, sampleBank);
-      } else {
-        scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, what, vel, sampleBank);
+    if (patternBeats >= chordBeats) {
+      // Pattern dài hơn hoặc bằng chord -> chỉ chơi các event nằm trong khoảng [0, chordBeats)
+      for (const ev of parsed.events) {
+        if (ev[0] >= chordBeats) continue;
+        const t = chordStart + ev[0] * secPerBeat;
+        const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
+        const vel = 0.85 + Math.random() * 0.15;
+        if (parsed.kind === "fp") {
+          scheduleFingerpick(ctx, inputBus, chords[ci], t + tJitter, ev[1], vel, sampleBank);
+        } else {
+          scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, ev[1], vel, sampleBank);
+        }
+      }
+    } else {
+      // Pattern ngắn hơn chord -> lặp đủ số lần
+      const repeats = Math.max(1, Math.round(chordBeats / patternBeats));
+      for (let rep = 0; rep < repeats; rep++) {
+        const repStart = chordStart + rep * patternBeats * secPerBeat;
+        for (const ev of parsed.events) {
+          const t = repStart + ev[0] * secPerBeat;
+          const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
+          const vel = 0.85 + Math.random() * 0.15;
+          if (parsed.kind === "fp") {
+            scheduleFingerpick(ctx, inputBus, chords[ci], t + tJitter, ev[1], vel, sampleBank);
+          } else {
+            scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, ev[1], vel, sampleBank);
+          }
+        }
       }
     }
   }
@@ -1488,16 +1520,38 @@ async function renderSongOffline(song, globalOpts, sampleRate, sampleBank) {
       if (!chordName) continue;  // bỏ chord không hỗ trợ
 
       const chordStart = sectionStart + ci * secPerChord;
-      for (const ev of parsed.events) {
-        const beatOffset = ev[0];
-        const what = ev[1];
-        const tBeat = chordStart + beatOffset * secPerBeat;
-        const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
-        const vel = 0.85 + Math.random() * 0.15;
-        if (parsed.kind === "fp") {
-          scheduleFingerpick(ctx, sectionGain, chordName, tBeat + tJitter, what, vel, sampleBank);
-        } else {
-          scheduleStrum(ctx, sectionGain, chordName, tBeat + tJitter, what, vel, sampleBank);
+      // Lặp pattern qua các bar trong chord — xem comment ở renderOffline
+      const chordBeats = bpb * barsPerChord;
+      const patternBeats = parsed.patternBeats || bpb;
+      const fpJ = parsed.kind === "fp" ? 0.006 : 0.012;
+
+      if (patternBeats >= chordBeats) {
+        // Pattern dài hơn hoặc bằng chord -> chỉ chơi event nằm trong [0, chordBeats)
+        for (const ev of parsed.events) {
+          if (ev[0] >= chordBeats) continue;
+          const tBeat = chordStart + ev[0] * secPerBeat;
+          const tJitter = (Math.random() - 0.5) * fpJ;
+          const vel = 0.85 + Math.random() * 0.15;
+          if (parsed.kind === "fp") {
+            scheduleFingerpick(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+          } else {
+            scheduleStrum(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+          }
+        }
+      } else {
+        const repeats = Math.max(1, Math.round(chordBeats / patternBeats));
+        for (let rep = 0; rep < repeats; rep++) {
+          const repStart = chordStart + rep * patternBeats * secPerBeat;
+          for (const ev of parsed.events) {
+            const tBeat = repStart + ev[0] * secPerBeat;
+            const tJitter = (Math.random() - 0.5) * fpJ;
+            const vel = 0.85 + Math.random() * 0.15;
+            if (parsed.kind === "fp") {
+              scheduleFingerpick(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+            } else {
+              scheduleStrum(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+            }
+          }
         }
       }
     }
