@@ -528,7 +528,13 @@ async function play() {
     const { buffer, secPerChord, totalSec } = renderSong(chords, { ...opts, sampleRate });
 
     const audioBuf = audioCtx.createBuffer(1, buffer.length, sampleRate);
-    audioBuf.copyToChannel(buffer, 0);
+    // copyToChannel không có trên Safari/iOS cũ -> fallback dùng getChannelData
+    if (typeof audioBuf.copyToChannel === "function") {
+      audioBuf.copyToChannel(buffer, 0);
+    } else {
+      const channel = audioBuf.getChannelData(0);
+      channel.set(buffer);
+    }
 
     if (currentSource) { try { currentSource.stop(); } catch (e) {} }
     const src = audioCtx.createBufferSource();
