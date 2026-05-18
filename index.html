@@ -57,7 +57,10 @@
   }
 
   .row { display: grid; gap: 12px; grid-template-columns: 1fr 1fr 1fr; }
-  @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
+  .row-2 { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 600px) {
+    .row, .row-2 { grid-template-columns: 1fr; }
+  }
 
   .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
   button {
@@ -101,6 +104,7 @@
   }
   .status.error { color: var(--bad); }
   .status.success { color: var(--good); }
+  .status.loading { color: var(--accent); }
 
   .now-playing {
     display: flex;
@@ -184,6 +188,26 @@
         </div>
       </div>
 
+      <div class="row-2" style="margin-top: 12px;">
+        <div>
+          <label for="tone">Tone (chất âm)</label>
+          <select id="tone">
+            <option value="acoustic" selected>Acoustic (mộc, cân bằng)</option>
+            <option value="warm">Warm (ấm, dày)</option>
+            <option value="bright">Bright (sáng, đanh)</option>
+          </select>
+        </div>
+        <div>
+          <label for="reverb">Reverb (vang)</label>
+          <select id="reverb">
+            <option value="0">Khô (không reverb)</option>
+            <option value="1" selected>Phòng nhỏ</option>
+            <option value="2">Phòng lớn</option>
+            <option value="3">Hall (hội trường)</option>
+          </select>
+        </div>
+      </div>
+
       <div class="btn-row">
         <button id="playBtn">▶ Play</button>
         <button id="stopBtn" class="secondary" disabled>⏹ Stop</button>
@@ -201,8 +225,8 @@
 
     <footer>
       <p>
-        Tổng hợp bằng thuật toán Karplus-Strong qua Web Audio API.
-        Cũng có CLI Python: <code>python chord_strum.py "C G Am F" -o song.wav</code>
+        Tổng hợp bằng Karplus-Strong + EQ + Convolution Reverb qua Web Audio API.
+        CLI Python: <code>python chord_strum.py "C G Am F" -o song.wav</code>
       </p>
     </footer>
   </div>
@@ -211,20 +235,18 @@
 "use strict";
 
 // ===========================================================================
-// Thư viện hợp âm — voicing chuẩn cho guitar 6 dây
+// Thư viện hợp âm
 // ===========================================================================
 const OPEN_STRING_FREQS = [
-  82.4069,   // E2 - dây 6 (trầm nhất)
-  110.0000,  // A2 - dây 5
-  146.8324,  // D3 - dây 4
-  195.9977,  // G3 - dây 3
-  246.9417,  // B3 - dây 2
-  329.6276,  // E4 - dây 1 (cao nhất)
+  82.4069,   // E2 - dây 6 (trầm)
+  110.0000,  // A2
+  146.8324,  // D3
+  195.9977,  // G3
+  246.9417,  // B3
+  329.6276,  // E4 - dây 1 (cao)
 ];
 
-// null = dây không gảy (mute)
 const CHORD_SHAPES = {
-  // Major
   "C":     [null, 3, 2, 0, 1, 0],
   "D":     [null, null, 0, 2, 3, 2],
   "E":     [0, 2, 2, 1, 0, 0],
@@ -232,7 +254,6 @@ const CHORD_SHAPES = {
   "G":     [3, 2, 0, 0, 0, 3],
   "A":     [null, 0, 2, 2, 2, 0],
   "B":     [null, 2, 4, 4, 4, 2],
-  // Minor
   "Cm":    [null, 3, 5, 5, 4, 3],
   "Dm":    [null, null, 0, 2, 3, 1],
   "Em":    [0, 2, 2, 0, 0, 0],
@@ -240,24 +261,20 @@ const CHORD_SHAPES = {
   "Gm":    [3, 5, 5, 3, 3, 3],
   "Am":    [null, 0, 2, 2, 1, 0],
   "Bm":    [null, 2, 4, 4, 3, 2],
-  // 7th
   "C7":    [null, 3, 2, 3, 1, 0],
   "D7":    [null, null, 0, 2, 1, 2],
   "E7":    [0, 2, 0, 1, 0, 0],
   "G7":    [3, 2, 0, 0, 0, 1],
   "A7":    [null, 0, 2, 0, 2, 0],
   "B7":    [null, 2, 1, 2, 0, 2],
-  // Minor 7
   "Am7":   [null, 0, 2, 0, 1, 0],
   "Dm7":   [null, null, 0, 2, 1, 1],
   "Em7":   [0, 2, 2, 0, 3, 0],
-  // Major 7
   "Cmaj7": [null, 3, 2, 0, 0, 0],
   "Dmaj7": [null, null, 0, 2, 2, 2],
   "Fmaj7": [null, null, 3, 2, 1, 0],
   "Gmaj7": [3, 2, 0, 0, 0, 2],
   "Amaj7": [null, 0, 2, 1, 2, 0],
-  // sus
   "Dsus2": [null, null, 0, 2, 3, 0],
   "Dsus4": [null, null, 0, 2, 3, 3],
   "Asus2": [null, 0, 2, 2, 0, 0],
@@ -280,52 +297,57 @@ function getChordFreqs(name) {
 }
 
 // ===========================================================================
-// Karplus-Strong: render 1 nốt thành Float32Array
+// Karplus-Strong cải tiến (Extended KS, Jaffe-Smith)
 // ===========================================================================
-function karplusStrong(freq, durationSec, sampleRate, decay = 0.996) {
-  const nSamples = Math.floor(durationSec * sampleRate);
-  const bufLen = Math.max(2, Math.round(sampleRate / freq));
-  const buf = new Float32Array(bufLen);
-  for (let i = 0; i < bufLen; i++) buf[i] = Math.random() * 2 - 1;
+function makeKarplusStrongBuffer(ctx, freq, durationSec) {
+  const sr = ctx.sampleRate;
+  const nSamples = Math.floor(durationSec * sr);
+  const bufLen = Math.max(2, Math.round(sr / freq));
 
-  const out = new Float32Array(nSamples);
+  // 1. Khởi tạo bằng noise đã low-pass nhẹ -> attack ấm, không xèo xèo
+  const buf = new Float32Array(bufLen);
+  let prev = 0;
+  const lpAlpha = 0.55;
+  for (let i = 0; i < bufLen; i++) {
+    const n = Math.random() * 2 - 1;
+    prev = prev * lpAlpha + n * (1 - lpAlpha);
+    buf[i] = prev;
+  }
+
+  // 2. Pluck position comb filter: mô phỏng gảy ở vị trí 13% chiều dài dây
+  //    (gần ngựa đàn -> sáng, gần phím -> mềm). Tạo notch ở 1 số harmonic.
+  const pluckPos = Math.max(1, Math.floor(bufLen * 0.13));
+  const orig = new Float32Array(buf);
+  for (let i = 0; i < bufLen; i++) {
+    const delayed = i - pluckPos >= 0 ? orig[i - pluckPos] : 0;
+    buf[i] = orig[i] - delayed * 0.5;
+  }
+
+  // 3. Vòng KS với decay tuỳ tần số (bass ngân lâu hơn) + stretch factor
+  const out = ctx.createBuffer(1, nSamples, sr);
+  const data = out.getChannelData(0);
+
+  const decay = freq < 130 ? 0.99905
+              : freq < 200 ? 0.99875
+              : freq < 280 ? 0.99840
+              : 0.99800;
+  const stretch = 0.5;  // Jaffe-Smith stretch
+
   let idx = 0;
   for (let i = 0; i < nSamples; i++) {
+    data[i] = buf[idx];
     const cur = buf[idx];
     const nxt = buf[(idx + 1) % bufLen];
-    buf[idx] = decay * 0.5 * (cur + nxt);
-    out[i] = cur;
+    let newVal;
+    if (Math.random() < stretch) {
+      newVal = decay * 0.5 * (cur + nxt);   // áp lowpass
+    } else {
+      newVal = decay * cur;                  // không lowpass -> kéo dài sustain
+    }
+    buf[idx] = newVal;
     idx = (idx + 1) % bufLen;
   }
   return out;
-}
-
-// ===========================================================================
-// Render strum vào target buffer
-// ===========================================================================
-function mixInto(target, src, offset, gain) {
-  const n = Math.min(src.length, target.length - offset);
-  for (let i = 0; i < n; i++) target[offset + i] += src[i] * gain;
-}
-
-function renderStrum(target, chord, startSample, durationSec, direction, sampleRate) {
-  let freqs = getChordFreqs(chord);
-  let velocity = 1.0;
-  let strumSpread = 0.020;
-  if (direction === "U") {
-    freqs = freqs.slice().reverse();
-    velocity = 0.7;
-    strumSpread = 0.012;
-  }
-  const perStringDelay = strumSpread / Math.max(1, freqs.length - 1);
-  for (let i = 0; i < freqs.length; i++) {
-    const note = karplusStrong(freqs[i], durationSec, sampleRate);
-    const offset = startSample + Math.floor(i * perStringDelay * sampleRate);
-    const gain = direction === "D"
-      ? velocity * (0.85 + 0.05 * i)
-      : velocity * (1.0 - 0.04 * i);
-    mixInto(target, note, offset, gain);
-  }
 }
 
 // ===========================================================================
@@ -346,92 +368,260 @@ function parsePattern(pattern) {
 }
 
 // ===========================================================================
-// Render full song
+// Schedule 1 cú strum trong OfflineAudioContext
 // ===========================================================================
-function renderSong(chords, opts) {
-  const { bpm, barsPerChord, beatsPerBar, pattern, sampleRate } = opts;
+function scheduleStrum(ctx, dest, chordName, time, direction, velocity) {
+  const allFreqs = getChordFreqs(chordName);
+  let freqs = direction === "D" ? allFreqs : allFreqs.slice().reverse();
+
+  const strumSpread = direction === "D" ? 0.022 : 0.013;
+  const perStringDelay = freqs.length > 1 ? strumSpread / (freqs.length - 1) : 0;
+
+  for (let i = 0; i < freqs.length; i++) {
+    const f = freqs[i];
+    // Humanize timing per-string nhẹ
+    const stringJitter = (Math.random() - 0.5) * 0.002;
+    const startTime = Math.max(0, time + i * perStringDelay + stringJitter);
+
+    const isBass = f < 150;
+    const noteDuration = direction === "U" ? 1.4 : (isBass ? 3.2 : 2.2);
+
+    const buffer = makeKarplusStrongBuffer(ctx, f, noteDuration);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    // Detune ±3 cent -> mỗi dây không "đứng im" perfect, chord dày hơn
+    src.detune.value = (Math.random() - 0.5) * 6;
+
+    // Pan: dây trầm -> hơi trái, dây cao -> hơi phải (như mic 1 cây acoustic)
+    const stringPos = direction === "D" ? i : (freqs.length - 1 - i);
+    const pan = freqs.length > 1
+      ? (stringPos / (freqs.length - 1) - 0.5) * 0.45
+      : 0;
+
+    let panNode;
+    if (typeof ctx.createStereoPanner === "function") {
+      panNode = ctx.createStereoPanner();
+      panNode.pan.value = pan;
+    } else {
+      panNode = ctx.createPanner();
+      panNode.panningModel = "equalpower";
+      panNode.setPosition(pan, 0, 1 - Math.abs(pan));
+    }
+
+    const gainNode = ctx.createGain();
+    const baseGain = direction === "D"
+      ? velocity * (0.78 + 0.04 * i)
+      : velocity * 0.62 * (1.0 - 0.05 * i);
+    // Attack ramp 4ms -> mềm click
+    gainNode.gain.setValueAtTime(0, startTime);
+    gainNode.gain.linearRampToValueAtTime(baseGain, startTime + 0.004);
+
+    src.connect(gainNode);
+    gainNode.connect(panNode);
+    panNode.connect(dest);
+
+    src.start(startTime);
+    src.stop(startTime + noteDuration + 0.05);
+  }
+}
+
+// ===========================================================================
+// Synthetic Impulse Response cho Convolver Reverb
+// ===========================================================================
+function makeIR(ctx, durationSec, decay, predelay = 0) {
+  const sr = ctx.sampleRate;
+  const length = Math.floor(durationSec * sr);
+  const ir = ctx.createBuffer(2, length, sr);
+  const preStart = Math.floor(predelay * sr);
+
+  for (let ch = 0; ch < 2; ch++) {
+    const data = ir.getChannelData(ch);
+    for (let i = preStart; i < length; i++) {
+      const t = (i - preStart) / (length - preStart);
+      const env = Math.pow(1 - t, decay);
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+    // Vài early reflection để có cảm giác không gian
+    const taps = [0.011, 0.019, 0.031, 0.047, 0.071];
+    for (const tt of taps) {
+      const idx = preStart + Math.floor(tt * sr);
+      if (idx < length) {
+        data[idx] += (Math.random() * 2 - 1) * 0.35;
+      }
+    }
+  }
+  return ir;
+}
+
+// ===========================================================================
+// Render offline -> AudioBuffer (stereo)
+// ===========================================================================
+async function renderOffline(chords, opts, sampleRate) {
+  const { bpm, barsPerChord, beatsPerBar, pattern, tone, reverb } = opts;
 
   const secPerBeat = 60 / bpm;
-  const secPerBar = secPerBeat * beatsPerBar;
-  const secPerChord = secPerBar * barsPerChord;
-  const noteDuration = Math.max(secPerBeat * 1.5, 0.8);
-
+  const secPerChord = secPerBeat * beatsPerBar * barsPerChord;
   const events = parsePattern(pattern);
   const patternLenBeats = beatsPerBar * barsPerChord;
 
-  const totalSec = secPerChord * chords.length + 1.5;
-  const totalSamples = Math.floor(totalSec * sampleRate);
-  const buffer = new Float32Array(totalSamples);
+  // Đuôi reverb dài hơn cho hall
+  const tailSec = reverb >= 3 ? 3.5 : reverb >= 2 ? 2.5 : reverb >= 1 ? 1.8 : 0.8;
+  const totalSec = secPerChord * chords.length + tailSec;
 
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const ctx = new OfflineCtx(2, Math.floor(totalSec * sampleRate), sampleRate);
+
+  // ----- Master chain: input -> HPF -> 3-band EQ -> compressor -> dry/wet -> dest
+  const inputBus = ctx.createGain();
+  inputBus.gain.value = 0.35;  // headroom trước khi qua chain
+
+  const hpf = ctx.createBiquadFilter();
+  hpf.type = "highpass";
+  hpf.frequency.value = 75;
+  hpf.Q.value = 0.7;
+
+  // EQ tuỳ tone
+  const eqLow = ctx.createBiquadFilter();
+  eqLow.type = "peaking";
+  eqLow.frequency.value = 130;
+  eqLow.Q.value = 0.9;
+
+  const eqMid = ctx.createBiquadFilter();
+  eqMid.type = "peaking";
+  eqMid.frequency.value = 700;
+  eqMid.Q.value = 0.7;
+
+  const eqHigh = ctx.createBiquadFilter();
+  eqHigh.type = "peaking";
+  eqHigh.frequency.value = 4200;
+  eqHigh.Q.value = 0.7;
+
+  if (tone === "warm") {
+    eqLow.gain.value = 4.5;
+    eqMid.gain.value = -3;
+    eqHigh.gain.value = -1;
+  } else if (tone === "bright") {
+    eqLow.gain.value = 0.5;
+    eqMid.gain.value = -1.5;
+    eqHigh.gain.value = 4.5;
+  } else {  // acoustic
+    eqLow.gain.value = 2.5;
+    eqMid.gain.value = -2;
+    eqHigh.gain.value = 2.5;
+  }
+
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -16;
+  comp.knee.value = 6;
+  comp.ratio.value = 3;
+  comp.attack.value = 0.003;
+  comp.release.value = 0.12;
+
+  // Reverb config
+  // 0 = không, 1 = phòng nhỏ, 2 = phòng lớn, 3 = hall
+  const REVERB_PRESETS = [
+    null,
+    { dur: 1.2, decay: 2.8, pre: 0.012, mix: 0.18 },
+    { dur: 2.0, decay: 2.5, pre: 0.020, mix: 0.28 },
+    { dur: 3.0, decay: 2.2, pre: 0.030, mix: 0.38 },
+  ];
+  const revCfg = REVERB_PRESETS[reverb] || null;
+
+  const dry = ctx.createGain();
+  const wet = ctx.createGain();
+  if (revCfg) {
+    dry.gain.value = 1 - revCfg.mix;
+    wet.gain.value = revCfg.mix * 1.2;
+  } else {
+    dry.gain.value = 1;
+    wet.gain.value = 0;
+  }
+
+  const master = ctx.createGain();
+  master.gain.value = 1.4;  // bù lại cho headroom đã giảm ở input
+
+  // Connect graph
+  inputBus.connect(hpf);
+  hpf.connect(eqLow);
+  eqLow.connect(eqMid);
+  eqMid.connect(eqHigh);
+  eqHigh.connect(comp);
+  comp.connect(dry);
+  dry.connect(master);
+
+  if (revCfg) {
+    const conv = ctx.createConvolver();
+    conv.buffer = makeIR(ctx, revCfg.dur, revCfg.decay, revCfg.pre);
+    comp.connect(conv);
+    conv.connect(wet);
+    wet.connect(master);
+  }
+
+  master.connect(ctx.destination);
+
+  // Schedule strums
   for (let ci = 0; ci < chords.length; ci++) {
     const chordStart = ci * secPerChord;
     for (const [beatOffset, dir] of events) {
       const wrapped = beatOffset % patternLenBeats;
       const t = chordStart + wrapped * secPerBeat;
-      renderStrum(buffer, chords[ci], Math.floor(t * sampleRate), noteDuration, dir, sampleRate);
+      // Humanize: timing ±6ms, velocity 0.85..1.0
+      const tJitter = (Math.random() - 0.5) * 0.012;
+      const vel = 0.85 + Math.random() * 0.15;
+      scheduleStrum(ctx, inputBus, chords[ci], t + tJitter, dir, vel);
     }
   }
 
-  // Normalize -0.95 .. 0.95
-  let peak = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    const a = Math.abs(buffer[i]);
-    if (a > peak) peak = a;
-  }
-  if (peak > 0) {
-    const scale = 0.95 / peak;
-    for (let i = 0; i < buffer.length; i++) buffer[i] *= scale;
-  }
-
-  return { buffer, secPerChord, totalSec };
+  return await ctx.startRendering();
 }
 
 // ===========================================================================
-// WAV encoding
+// Encode AudioBuffer -> WAV (stereo, 16-bit PCM)
 // ===========================================================================
-function bufferToWav(buffer, sampleRate) {
-  const numSamples = buffer.length;
+function audioBufferToWav(audioBuffer) {
+  const numCh = audioBuffer.numberOfChannels;
+  const sr = audioBuffer.sampleRate;
+  const numSamples = audioBuffer.length;
   const bytesPerSample = 2;
-  const dataSize = numSamples * bytesPerSample;
+  const blockAlign = numCh * bytesPerSample;
+  const dataSize = numSamples * blockAlign;
   const fileSize = 44 + dataSize;
+
   const ab = new ArrayBuffer(fileSize);
   const view = new DataView(ab);
+  let p = 0;
+  const ws = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
+  const w32 = (v) => { view.setUint32(p, v, true); p += 4; };
+  const w16 = (v) => { view.setUint16(p, v, true); p += 2; };
 
-  function writeStr(o, s) {
-    for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i));
-  }
+  ws("RIFF"); w32(fileSize - 8); ws("WAVE");
+  ws("fmt "); w32(16); w16(1); w16(numCh);
+  w32(sr); w32(sr * blockAlign); w16(blockAlign); w16(16);
+  ws("data"); w32(dataSize);
 
-  writeStr(0, "RIFF");
-  view.setUint32(4, fileSize - 8, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);          // PCM
-  view.setUint16(22, 1, true);          // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * bytesPerSample, true);
-  view.setUint16(32, bytesPerSample, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, "data");
-  view.setUint32(40, dataSize, true);
+  const channels = [];
+  for (let ch = 0; ch < numCh; ch++) channels.push(audioBuffer.getChannelData(ch));
 
-  let offset = 44;
   for (let i = 0; i < numSamples; i++) {
-    let v = Math.max(-1, Math.min(1, buffer[i]));
-    view.setInt16(offset, v * 32767, true);
-    offset += 2;
+    for (let ch = 0; ch < numCh; ch++) {
+      const v = Math.max(-1, Math.min(1, channels[ch][i]));
+      view.setInt16(p, v * 32767, true);
+      p += 2;
+    }
   }
   return new Blob([ab], { type: "audio/wav" });
 }
 
 // ===========================================================================
-// UI logic
+// UI
 // ===========================================================================
 const $ = (id) => document.getElementById(id);
 const chordsInput = $("chords");
 const bpmInput = $("bpm");
 const barsSelect = $("bars");
 const patternSelect = $("pattern");
+const toneSelect = $("tone");
+const reverbSelect = $("reverb");
 const playBtn = $("playBtn");
 const stopBtn = $("stopBtn");
 const downloadBtn = $("downloadBtn");
@@ -439,7 +629,6 @@ const statusEl = $("status");
 const nowPlayingEl = $("nowPlaying");
 const chordListEl = $("chordList");
 
-// Render danh sách hợp âm hỗ trợ
 Object.keys(CHORD_SHAPES).sort().forEach((name) => {
   const span = document.createElement("span");
   span.className = "pill";
@@ -452,14 +641,13 @@ Object.keys(CHORD_SHAPES).sort().forEach((name) => {
   chordListEl.appendChild(span);
 });
 
-// Preset clicks
 document.querySelectorAll("[data-preset]").forEach((el) => {
   el.addEventListener("click", () => {
     chordsInput.value = el.getAttribute("data-preset");
   });
 });
 
-let audioCtx = null;
+let playCtx = null;
 let currentSource = null;
 let highlightTimers = [];
 
@@ -486,6 +674,8 @@ function getOpts() {
     barsPerChord: parseInt(barsSelect.value, 10),
     beatsPerBar: 4,
     pattern: patternSelect.value,
+    tone: toneSelect.value,
+    reverb: parseInt(reverbSelect.value, 10),
   };
 }
 
@@ -512,44 +702,42 @@ function clearHighlights() {
   document.querySelectorAll(".chord-box").forEach((el) => el.classList.remove("active"));
 }
 
+function secPerChordOf(opts) {
+  return (60 / opts.bpm) * opts.beatsPerBar * opts.barsPerChord;
+}
+
 async function play() {
   try {
     const chords = parseChords();
     const opts = getOpts();
     renderNowPlaying(chords);
-    setStatus("Đang render...");
+    setStatus("Đang render audio...", "loading");
+    playBtn.disabled = true;
 
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === "suspended") await audioCtx.resume();
+    if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (playCtx.state === "suspended") await playCtx.resume();
 
-    const sampleRate = audioCtx.sampleRate;
-    // Render trong setTimeout để UI không bị đơ
+    const sr = playCtx.sampleRate;
+    // Yield trước khi render để UI cập nhật
     await new Promise((r) => setTimeout(r, 10));
-    const { buffer, secPerChord, totalSec } = renderSong(chords, { ...opts, sampleRate });
-
-    const audioBuf = audioCtx.createBuffer(1, buffer.length, sampleRate);
-    // copyToChannel không có trên Safari/iOS cũ -> fallback dùng getChannelData
-    if (typeof audioBuf.copyToChannel === "function") {
-      audioBuf.copyToChannel(buffer, 0);
-    } else {
-      const channel = audioBuf.getChannelData(0);
-      channel.set(buffer);
-    }
+    const t0 = performance.now();
+    const rendered = await renderOffline(chords, opts, sr);
+    const renderMs = (performance.now() - t0).toFixed(0);
 
     if (currentSource) { try { currentSource.stop(); } catch (e) {} }
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.connect(audioCtx.destination);
+    const src = playCtx.createBufferSource();
+    src.buffer = rendered;
+    src.connect(playCtx.destination);
     src.start();
     currentSource = src;
 
-    setStatus(`Đang phát ${chords.length} hợp âm (${totalSec.toFixed(1)}s)`, "success");
-    playBtn.disabled = true;
+    setStatus(`Đang phát ${chords.length} hợp âm (${rendered.duration.toFixed(1)}s) — render ${renderMs}ms`, "success");
     stopBtn.disabled = false;
 
     clearHighlights();
+    const spc = secPerChordOf(opts);
     chords.forEach((_, i) => {
-      highlightTimers.push(setTimeout(() => highlightChord(i), i * secPerChord * 1000));
+      highlightTimers.push(setTimeout(() => highlightChord(i), i * spc * 1000));
     });
 
     src.onended = () => {
@@ -560,6 +748,8 @@ async function play() {
     };
   } catch (e) {
     setStatus("Lỗi: " + e.message, "error");
+    playBtn.disabled = false;
+    stopBtn.disabled = true;
   }
 }
 
@@ -574,16 +764,17 @@ function stop() {
   setStatus("Đã dừng.");
 }
 
-function download() {
+async function download() {
   try {
     const chords = parseChords();
     const opts = getOpts();
-    setStatus("Đang tạo file WAV...");
+    setStatus("Đang render WAV (44.1 kHz stereo)...", "loading");
+    downloadBtn.disabled = true;
 
-    // Dùng sample rate cố định khi download để file nhất quán
-    const sampleRate = 44100;
-    const { buffer } = renderSong(chords, { ...opts, sampleRate });
-    const blob = bufferToWav(buffer, sampleRate);
+    await new Promise((r) => setTimeout(r, 10));
+    const rendered = await renderOffline(chords, opts, 44100);
+    const blob = audioBufferToWav(rendered);
+
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -592,9 +783,13 @@ function download() {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    setStatus(`Đã tải file: ${a.download}`, "success");
+
+    const sizeMB = (blob.size / 1024 / 1024).toFixed(2);
+    setStatus(`Đã tải: ${a.download} (${sizeMB} MB, ${rendered.duration.toFixed(1)}s)`, "success");
   } catch (e) {
     setStatus("Lỗi: " + e.message, "error");
+  } finally {
+    downloadBtn.disabled = false;
   }
 }
 
@@ -602,7 +797,6 @@ playBtn.addEventListener("click", play);
 stopBtn.addEventListener("click", stop);
 downloadBtn.addEventListener("click", download);
 
-// Enter trong ô chord = play
 chordsInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); play(); }
 });
