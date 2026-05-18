@@ -71,6 +71,15 @@ Mặc định 8 ký tự = 1 ô nhịp 4/4. Ví dụ:
 - `D---D---` → ballad chậm (1 cú quẹt mỗi 2 phách)
 - `DUDUDUDU` → 16th note liên tục, sôi động
 
+### Pattern fingerpicking (chỉ trên Web app)
+
+Web app còn hỗ trợ gảy ngón thay vì strum:
+
+- **Travis picking** — luân phiên bass (P) + ngón i, kiểu folk/country
+- **Arpeggio P-I-M-A** — gảy lần lượt 4 dây, kiểu cổ điển
+- **Ballad chậm** — bass + 3 dây cao đồng thời, mỗi 2 phách
+- **Waltz 3/4** — P I M, hợp với nhịp 3/4
+
 ---
 
 ## Hợp âm hỗ trợ
