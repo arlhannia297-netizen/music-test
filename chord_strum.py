@@ -240,32 +240,71 @@ def render_song(
     sec_per_chord = sec_per_bar * bars_per_chord
 
     pattern_events = parse_pattern(pattern, beats_per_bar=beats_per_bar)
-    pattern_len_beats = beats_per_bar * bars_per_chord  # độ dài 1 ô hợp âm tính bằng beat
 
-    # Mỗi nốt được đánh sẽ rung lâu hơn 1 chút (sustain) so với khoảng giữa các đợt strum
-    note_duration = max(sec_per_beat * 1.5, 0.8)
+    # Pattern user nhập có thể dài 1 bar (8 ký tự = 4 beats) HOẶC dài hơn (multi-bar).
+    # Tính số bar mà pattern tự bao phủ -> sau đó lặp pattern đủ để phủ hết hợp âm.
+    if pattern_events:
+        max_beat = max(b for b, _ in pattern_events)
+        pattern_bars = max(1, math.ceil((max_beat + 0.5) / beats_per_bar))
+    else:
+        pattern_bars = 1
+    # Số lần lặp pattern để cover toàn bộ chord-window. Làm tròn lên.
+    pattern_repeats = max(1, math.ceil(bars_per_chord / pattern_bars))
+    pattern_span_beats = pattern_bars * beats_per_bar  # khoảng cách giữa các lần lặp
+
+    # Note duration: cắt theo BPM, chỉ cần ngân ~3-4 phách là đủ overlap
+    # (trước hard-code 0.8s -> với BPM cao thì giật, BPM thấp thì cắt sớm)
+    note_duration = max(sec_per_beat * 3.5, 0.9)
 
     total_seconds = sec_per_chord * len(chords) + 1.5  # +1.5s đuôi cho ring-out
     total_samples = int(total_seconds * sample_rate)
     buffer = [0.0] * total_samples
 
+    # ---- Tối ưu render: cache Karplus-Strong cho mỗi (hợp âm, direction) ----
+    # Ý tưởng: 1 hợp âm có 5-6 dây, pattern lặp lại 6-16 lần trong cả bài.
+    # Trước đây Karplus-Strong được chạy lại MỖI lần strum -> rất tốn CPU.
+    # Giờ pre-render mỗi cú quẹt 1 lần thành "blob", sau đó mix blob ở các thời điểm.
+    blob_cache: dict[Tuple[str, str], List[float]] = {}
+
+    def get_strum_blob(chord_name: str, direction: str) -> List[float]:
+        key = (chord_name, direction)
+        cached = blob_cache.get(key)
+        if cached is not None:
+            return cached
+        blob_len = int(note_duration * sample_rate) + int(0.05 * sample_rate)
+        blob = [0.0] * blob_len
+        # Re-use render_strum nhưng vào buffer riêng, không cần rng cố định cho blob
+        render_strum(
+            blob,
+            chord_name,
+            start_sample=0,
+            duration=note_duration,
+            direction=direction,
+            velocity=1.0,
+            sample_rate=sample_rate,
+            rng=rng,
+        )
+        blob_cache[key] = blob
+        return blob
+
     for chord_index, chord_name in enumerate(chords):
         chord_start_sec = chord_index * sec_per_chord
-        for beat_offset, direction in pattern_events:
-            # Cho phép pattern dài hoặc ngắn hơn 1 ô — wrap quanh
-            wrapped = beat_offset % pattern_len_beats
-            t = chord_start_sec + wrapped * sec_per_beat
-            start_sample = int(t * sample_rate)
-            render_strum(
-                buffer,
-                chord_name,
-                start_sample=start_sample,
-                duration=note_duration,
-                direction=direction,
-                velocity=1.0,
-                sample_rate=sample_rate,
-                rng=rng,
-            )
+        # FIX BUG Ô NHỊP: pattern có thể dài 1 bar (vd "D-DU-UDU") hoặc nhiều bar
+        # (vd "D-DU-UDU-DU-UDU-" = 2 bar). Nếu chord kéo nhiều bar hơn pattern,
+        # ta lặp pattern để phủ hết. Trước đây code chỉ play pattern 1 lần ở đầu
+        # rồi để các bar sau hoàn toàn trống — đó chính là bug.
+        for rep in range(pattern_repeats):
+            rep_start_sec = chord_start_sec + rep * pattern_span_beats * sec_per_beat
+            # Đừng vượt khỏi cửa sổ chord (trường hợp pattern không chia hết)
+            if rep_start_sec >= chord_start_sec + sec_per_chord:
+                break
+            for beat_offset, direction in pattern_events:
+                t = rep_start_sec + beat_offset * sec_per_beat
+                if t >= chord_start_sec + sec_per_chord:
+                    continue
+                start_sample = int(t * sample_rate)
+                blob = get_strum_blob(chord_name, direction)
+                mix_into(buffer, blob, start_sample, 1.0)
 
     return buffer
 
