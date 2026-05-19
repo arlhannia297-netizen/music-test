@@ -126,3 +126,23 @@ music-test/
 ```
 
 Không có dependency nào. Pure Python stdlib + vanilla JavaScript.
+
+---
+
+## Changelog
+
+### Bug fixes
+
+- **Ô nhịp:** trước đây khi đặt `bars-per-chord >= 2` với pattern dài 1 ô nhịp,
+  pattern chỉ play ở ô đầu rồi các ô sau hoàn toàn trống. Giờ pattern được lặp
+  đủ để phủ hết khoảng kéo dài của hợp âm. Pattern dài nhiều ô nhịp (vd
+  `D-DU-UDU-DU-UDU-`) cũng được nhận diện đúng và không bị trigger thừa.
+
+### Performance
+
+- **Python (~38% nhanh hơn):** cache Karplus-Strong blob theo `(hợp âm, hướng quẹt)`,
+  thay vì sinh lại nhiễu trắng + lặp Karplus-Strong cho mỗi cú strum.
+- **Web app:** giảm số node Web Audio bằng cách share 6 `StereoPanner` cố định
+  theo string position thay vì tạo mới mỗi nốt; bỏ Gain trung gian thừa;
+  thời lượng note tự co theo BPM thay vì hard-code 2-3 giây.
+
