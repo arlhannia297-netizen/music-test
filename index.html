@@ -419,9 +419,46 @@ async function decodeSampleBank(audioCtx, jsonObj, onProgress) {
   const bank = new Map();
   let done = 0;
 
-  // Decode song song nhưng giới hạn số lượng (an toàn cho mobile)
-  const CONC = 8;
+  // Decode song song nhưng giới hạn — concurrency thấp tránh stall trên Safari/Chrome
+  // khi gặp ArrayBuffer "lạ" (decodeAudioData có thể bị deadlock).
+  // Wrap mỗi decode bằng timeout 8s -> nếu sample lỗi cũng không kẹt cả pool.
+  const CONC = 4;
   let cursor = 0;
+
+  function decodeWithTimeout(audioCtx, ab, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("decodeAudioData timeout"));
+        }
+      }, timeoutMs);
+
+      const onSuccess = (buf) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(buf);
+        }
+      };
+      const onError = (err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(err || new Error("decodeAudioData failed"));
+        }
+      };
+
+      try {
+        const p = audioCtx.decodeAudioData(ab, onSuccess, onError);
+        if (p && typeof p.then === "function") p.then(onSuccess, onError);
+      } catch (e) {
+        onError(e);
+      }
+    });
+  }
+
   async function worker() {
     while (cursor < entries.length) {
       const i = cursor++;
@@ -430,37 +467,50 @@ async function decodeSampleBank(audioCtx, jsonObj, onProgress) {
       const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
       try {
         const ab = base64ToArrayBuffer(b64);
-        // decodeAudioData trả Promise trên trình duyệt mới, callback trên cũ
-        const buf = await new Promise((res, rej) => {
-          const p = audioCtx.decodeAudioData(ab, res, rej);
-          if (p && typeof p.then === "function") p.then(res, rej);
-        });
+        const buf = await decodeWithTimeout(audioCtx, ab, 8000);
         bank.set(midi, buf);
       } catch (err) {
-        console.warn("Decode lỗi cho", name, err);
+        console.warn("Decode skipped for", name, err && err.message ? err.message : err);
+      } finally {
+        done++;
+        if (onProgress) onProgress(done, total);
       }
-      done++;
-      if (onProgress) onProgress(done, total);
     }
   }
   await Promise.all(Array.from({ length: CONC }, worker));
   return bank;
 }
 
+// Cache promise (không phải kết quả) để tránh 2 lần Play song song trigger 2 lần decode
+const sampleBankPromises = {};
+
 async function ensureSampleBank(audioCtx, engineKey, onProgress) {
   if (engineKey === "ks") return null;
   if (sampleBanks[engineKey]) return sampleBanks[engineKey];
+  if (sampleBankPromises[engineKey]) return sampleBankPromises[engineKey];
 
-  if (onProgress) onProgress("downloading", 0, 0);
-  const json = await loadSoundfontScript(engineKey);
+  sampleBankPromises[engineKey] = (async () => {
+    try {
+      if (onProgress) onProgress("downloading", 0, 0);
+      const json = await loadSoundfontScript(engineKey);
 
-  if (onProgress) onProgress("decoding", 0, 0);
-  const bank = await decodeSampleBank(audioCtx, json, (d, t) => {
-    if (onProgress) onProgress("decoding", d, t);
-  });
-  if (bank.size === 0) throw new Error("Không decode được sample nào");
-  sampleBanks[engineKey] = bank;
-  return bank;
+      if (onProgress) onProgress("decoding", 0, 0);
+      const bank = await decodeSampleBank(audioCtx, json, (d, t) => {
+        if (onProgress) onProgress("decoding", d, t);
+      });
+      if (bank.size === 0) {
+        throw new Error("Không decode được sample nào — engine sẽ fallback về Synth (ks)");
+      }
+      sampleBanks[engineKey] = bank;
+      if (onProgress) onProgress("done", bank.size, bank.size);
+      return bank;
+    } finally {
+      // Cho phép retry nếu fail
+      delete sampleBankPromises[engineKey];
+    }
+  })();
+
+  return sampleBankPromises[engineKey];
 }
 
 function findClosestSample(bank, midi) {
@@ -684,13 +734,20 @@ const FP_PATTERNS = {
 // ===========================================================================
 function parsePattern(pattern) {
   // Fingerpicking pattern -> trả lại trực tiếp
+  // patternBeats = độ dài 1 chu kỳ pattern (tính bằng beat). FP pattern lặp mỗi
+  // beatsPerBar (vd Travis = 4 beats, Waltz = 3 beats).
   if (pattern.startsWith("fp:")) {
     const fp = FP_PATTERNS[pattern];
     if (!fp) throw new Error("Pattern fingerpicking không tồn tại: " + pattern);
-    return { kind: "fp", events: fp.events, beatsPerBar: fp.beatsPerBar };
+    return {
+      kind: "fp",
+      events: fp.events,
+      beatsPerBar: fp.beatsPerBar,
+      patternBeats: fp.beatsPerBar,
+    };
   }
 
-  // Strum pattern: D/U/-/.
+  // Strum pattern: D/U/-/. — mỗi ký tự = 1/8 nốt = 0.5 beat
   const events = [];
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
@@ -701,7 +758,11 @@ function parsePattern(pattern) {
     else throw new Error(`Pattern ký tự không hợp lệ: '${ch}'`);
   }
   if (events.length === 0) events.push([0, "D"]);
-  return { kind: "strum", events: events, beatsPerBar: null };
+  // Tổng độ dài pattern (kể cả các ký tự nghỉ ở cuối)
+  // Vd "D-DU-UDU" (8 chars) = 4 beats = 1 bar 4/4
+  // Vd "D-DU-UDU-DU-UDU-" (16 chars) = 8 beats = 2 bar
+  const patternBeats = Math.max(1, pattern.length / 2);
+  return { kind: "strum", events: events, beatsPerBar: null, patternBeats: patternBeats };
 }
 
 // ===========================================================================
@@ -808,701 +869,37 @@ async function renderOffline(chords, opts, sampleRate, sampleBank) {
   }
   master.connect(ctx.destination);
 
-  // Cache 6 panner cố định (theo dây) gắn vào inputBus
-  const panners = createStringPanners(ctx, inputBus);
-
-  // Adaptive note duration theo BPM: ngân ~3.5 phách là đủ overlap, BPM cao thì tự ngắn.
-  const noteDurationBass = Math.min(2.6, Math.max(secPerBeat * 4.0, 1.0));
-  const noteDurationTreble = Math.min(2.0, Math.max(secPerBeat * 3.0, 0.8));
-
-  // Schedule
-  // FIX BUG Ô NHỊP: pattern user có thể dài 1 bar HOẶC nhiều bar.
-  // Trước đây code chỉ play pattern 1 lần ở đầu hợp âm -> các bar sau trống.
-  // Giờ tính độ dài pattern theo beats, lặp đủ để phủ hết chord-window.
-  const maxBeatInPattern = parsed.events.length
-    ? Math.max(...parsed.events.map((e) => e[0]))
-    : 0;
-  const patternBars = Math.max(1, Math.ceil((maxBeatInPattern + 0.5) / effectiveBeatsPerBar));
-  const patternRepeats = Math.max(1, Math.ceil(barsPerChord / patternBars));
-  const patternSpanBeats = patternBars * effectiveBeatsPerBar;
-
-  for (let ci = 0; ci < chords.length; ci++) {
-    const chordStart = ci * secPerChord;
-    for (let rep = 0; rep < patternRepeats; rep++) {
-      const repStart = chordStart + rep * patternSpanBeats * secPerBeat;
-      if (repStart >= chordStart + secPerChord) break;
-      for (const ev of parsed.events) {
-        const beatOffset = ev[0];
-        const what = ev[1];
-        const t = repStart + beatOffset * secPerBeat;
-        if (t >= chordStart + secPerChord) continue;
-        // Fingerpicking ít jitter hơn strum (gảy ngón chính xác)
-        const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
-        const vel = 0.85 + Math.random() * 0.15;
-        if (parsed.kind === "fp") {
-          scheduleFingerpick(ctx, panners, chords[ci], t + tJitter, what, vel, sampleBank,
-                             noteDurationBass, noteDurationTreble);
-        } else {
-          scheduleStrum(ctx, panners, chords[ci], t + tJitter, what, vel, sampleBank,
-                        noteDurationBass, noteDurationTreble);
-        }
-      }
-    }
-  }
-
-  return await ctx.startRendering();
-}
-
-// ===========================================================================
-// AudioBuffer -> WAV stereo 16-bit
-// ===========================================================================
-function audioBufferToWav(audioBuffer) {
-  const numCh = audioBuffer.numberOfChannels;
-  const sr = audioBuffer.sampleRate;
-  const numSamples = audioBuffer.length;
-  const blockAlign = numCh * 2;
-  const dataSize = numSamples * blockAlign;
-  const fileSize = 44 + dataSize;
-  const ab = new ArrayBuffer(fileSize);
-  const view = new DataView(ab);
-  let p = 0;
-  const ws = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
-  const w32 = (v) => { view.setUint32(p, v, true); p += 4; };
-  const w16 = (v) => { view.setUint16(p, v, true); p += 2; };
-  ws("RIFF"); w32(fileSize - 8); ws("WAVE");
-  ws("fmt "); w32(16); w16(1); w16(numCh);
-  w32(sr); w32(sr * blockAlign); w16(blockAlign); w16(16);
-  ws("data"); w32(dataSize);
-  const channels = [];
-  for (let ch = 0; ch < numCh; ch++) channels.push(audioBuffer.getChannelData(ch));
-  for (let i = 0; i < numSamples; i++) {
-    for (let ch = 0; ch < numCh; ch++) {
-      const v = Math.max(-1, Math.min(1, channels[ch][i]));
-      view.setInt16(p, v * 32767, true);
-      p += 2;
-    }
-  }
-  return new Blob([ab], { type: "audio/wav" });
-}
-
-// ===========================================================================
-// UI
-// ===========================================================================
-const $ = (id) => document.getElementById(id);
-const chordsInput = $("chords");
-const bpmInput = $("bpm");
-const barsSelect = $("bars");
-const patternSelect = $("pattern");
-const engineSelect = $("engine");
-const toneSelect = $("tone");
-const reverbSelect = $("reverb");
-const playBtn = $("playBtn");
-const stopBtn = $("stopBtn");
-const downloadBtn = $("downloadBtn");
-const statusEl = $("status");
-const nowPlayingEl = $("nowPlaying");
-const chordListEl = $("chordList");
-
-Object.keys(CHORD_SHAPES).sort().forEach((name) => {
-  const span = document.createElement("span");
-  span.className = "pill";
-  span.textContent = name;
-  span.addEventListener("click", () => {
-    const cur = chordsInput.value.trim();
-    chordsInput.value = cur ? cur + " " + name : name;
-    chordsInput.focus();
-  });
-  chordListEl.appendChild(span);
-});
-
-document.querySelectorAll("[data-preset]").forEach((el) => {
-  el.addEventListener("click", () => {
-    chordsInput.value = el.getAttribute("data-preset");
-  });
-});
-
-let playCtx = null;
-let currentSource = null;
-let highlightTimers = [];
-
-function setStatus(msg, kind) {
-  statusEl.textContent = msg;
-  statusEl.className = "status " + (kind || "");
-}
-
-function parseChords() {
-  const raw = chordsInput.value.replace(/,/g, " ").split(/\s+/).map((s) => s.trim()).filter(Boolean);
-  if (raw.length === 0) throw new Error("Cần nhập ít nhất 1 hợp âm");
-  const unknown = raw.filter((c) => !CHORD_SHAPES[c]);
-  if (unknown.length > 0) throw new Error("Hợp âm chưa hỗ trợ: " + unknown.join(", "));
-  return raw;
-}
-
-function getOpts() {
-  const bpm = parseFloat(bpmInput.value);
-  if (!isFinite(bpm) || bpm < 30 || bpm > 240) throw new Error("BPM phải từ 30 đến 240");
-  return {
-    bpm,
-    barsPerChord: parseInt(barsSelect.value, 10),
-    beatsPerBar: 4,
-    pattern: patternSelect.value,
-    engine: engineSelect.value,
-    tone: toneSelect.value,
-    reverb: parseInt(reverbSelect.value, 10),
-  };
-}
-
-function renderNowPlaying(chords) {
-  nowPlayingEl.innerHTML = "";
-  chords.forEach((c, i) => {
-    const div = document.createElement("div");
-    div.className = "chord-box";
-    div.dataset.idx = i;
-    div.textContent = c;
-    nowPlayingEl.appendChild(div);
-  });
-}
-
-function highlightChord(idx) {
-  document.querySelectorAll(".chord-box").forEach((el) => {
-    el.classList.toggle("active", parseInt(el.dataset.idx, 10) === idx);
-  });
-}
-
-function clearHighlights() {
-  highlightTimers.forEach((t) => clearTimeout(t));
-  highlightTimers = [];
-  document.querySelectorAll(".chord-box").forEach((el) => el.classList.remove("active"));
-}
-
-function secPerChordOf(opts) {
-  const parsed = parsePattern(opts.pattern);
-  const bpb = parsed.beatsPerBar || opts.beatsPerBar;
-  return (60 / opts.bpm) * bpb * opts.barsPerChord;
-}
-
-async function ensureBank(opts) {
-  if (opts.engine === "ks") return null;
-  if (sampleBanks[opts.engine]) return sampleBanks[opts.engine];
-
-  if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
-  return await ensureSampleBank(playCtx, opts.engine, (phase, done, total) => {
-    if (phase === "downloading") {
-      setStatus(`Đang tải soundfont ${ENGINE_INFO[opts.engine].label}... (~5-8 MB, lần đầu)`, "loading");
-    } else if (phase === "decoding") {
-      setStatus(`Đang giải mã sample ${done}/${total}...`, "loading");
-    }
-  });
-}
-
-async function play() {
-  try {
-    const chords = parseChords();
-    const opts = getOpts();
-    renderNowPlaying(chords);
-    playBtn.disabled = true;
-
-    if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (playCtx.state === "suspended") await playCtx.resume();
-
-    const bank = await ensureBank(opts);
-
-    setStatus("Đang render audio...", "loading");
-    await new Promise((r) => setTimeout(r, 10));
-    const t0 = performance.now();
-    const rendered = await renderOffline(chords, opts, playCtx.sampleRate, bank);
-    const renderMs = (performance.now() - t0).toFixed(0);
-
-    if (currentSource) { try { currentSource.stop(); } catch (e) {} }
-    const src = playCtx.createBufferSource();
-    src.buffer = rendered;
-    src.connect(playCtx.destination);
-    src.start();
-    currentSource = src;
-
-    setStatus(
-      `Đang phát ${chords.length} hợp âm (${rendered.duration.toFixed(1)}s) — render ${renderMs}ms — engine: ${opts.engine}`,
-      "success"
-    );
-    stopBtn.disabled = false;
-
-    clearHighlights();
-    const spc = secPerChordOf(opts);
-    chords.forEach((_, i) => {
-      highlightTimers.push(setTimeout(() => highlightChord(i), i * spc * 1000));
-    });
-
-    src.onended = () => {
-      playBtn.disabled = false;
-      stopBtn.disabled = true;
-      clearHighlights();
-      if (currentSource === src) currentSource = null;
-    };
-  } catch (e) {
-    console.error(e);
-    setStatus("Lỗi: " + e.message, "error");
-    playBtn.disabled = false;
-    stopBtn.disabled = true;
-  }
-}
-
-function stop() {
-  if (currentSource) {
-    try { currentSource.stop(); } catch (e) {}
-    currentSource = null;
-  }
-  playBtn.disabled = false;
-  stopBtn.disabled = true;
-  clearHighlights();
-  setStatus("Đã dừng.");
-}
-
-async function download() {
-  try {
-    const chords = parseChords();
-    const opts = getOpts();
-    downloadBtn.disabled = true;
-
-    if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const bank = await ensureBank(opts);
-
-    setStatus("Đang render WAV (44.1 kHz stereo)...", "loading");
-    await new Promise((r) => setTimeout(r, 10));
-    const rendered = await renderOffline(chords, opts, 44100, bank);
-    const blob = audioBufferToWav(rendered);
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `chord-strum-${chords.join("-")}.wav`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-    const sizeMB = (blob.size / 1024 / 1024).toFixed(2);
-    setStatus(`Đã tải: ${a.download} (${sizeMB} MB, ${rendered.duration.toFixed(1)}s)`, "success");
-  } catch (e) {
-    console.error(e);
-    setStatus("Lỗi: " + e.message, "error");
-  } finally {
-    downloadBtn.disabled = false;
-  }
-}
-
-playBtn.addEventListener("click", play);
-stopBtn.addEventListener("click", stop);
-downloadBtn.addEventListener("click", download);
-
-chordsInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); play(); }
-});
-
-// ===========================================================================
-// SongScript parser — paste text/HTML có hợp âm trong [Brackets]
-// ===========================================================================
-//
-// Format trung gian:
-//   { sections: [
-//       { name, type, pattern, bpm, vol, chords: ["C","Am",...], rawText }
-//     ] }
-//
-// Quy ước:
-//   - Tên section: dòng kết thúc bằng ":" hoặc nằm trong "[Verse]" v.v.
-//     Vd: "Ver 1", "Verse 1:", "ĐK:", "[Chorus]", "Rap:", "Intro"
-//   - Hợp âm: bất cứ thứ gì khớp /\[([A-G][b#]?(?:m|maj|sus|dim|aug)?\d*)\]/
-//   - Trong cùng section, chord giữ thứ tự, lặp lại được.
-
-// Auto-detect type theo tên section -> chọn pattern mặc định
-// Lưu ý: \b trong JS regex không Unicode-aware (không match đúng quanh "Đ"),
-// nên ta dùng pattern không có \b cho từ tiếng Việt và dùng .test trên lowercase
-const SECTION_TYPE_RULES = [
-  { rx: /(^|\W)(intro|dạo)(\W|$)/i,                       type: "intro",  pattern: "fp:arpeggio", volPct: 75 },
-  { rx: /(^|\W)(outro|ending|coda|kết)(\W|$)/i,           type: "outro",  pattern: "fp:arpeggio", volPct: 75 },
-  // verse/ver bắt cả "Verse2", "Ver 1"
-  { rx: /(^|\W)(verse|ver|đoạn|phiên\s*khúc)\d*(\W|$)/i,  type: "verse",  pattern: "fp:travis",   volPct: 85 },
-  { rx: /(^|\W)(pre[-\s]?chorus|pre)(\W|$)/i,             type: "pre",    pattern: "D-D-D-D-",    volPct: 90 },
-  // ĐK / điệp khúc — không dùng \b vì chữ Đ
-  { rx: /(^|\W)(chorus|đk|điệp\s*khúc|refrain)(\W|$)/i,   type: "chorus", pattern: "D-DU-UDU",    volPct: 100 },
-  { rx: /(^|\W)(bridge|cầu)(\W|$)/i,                      type: "bridge", pattern: "D---D---",    volPct: 85 },
-  { rx: /(^|\W)(rap|spoken)(\W|$)/i,                      type: "rap",    pattern: "D-D-D-D-",    volPct: 90 },
-];
-
-function classifySection(name) {
-  // Chuẩn hoá thành " name " để (^|\W) match được khi tên chỉ là 1 từ ("ĐK", "Rap")
-  const padded = " " + name.trim().toLowerCase() + " ";
-  for (const rule of SECTION_TYPE_RULES) {
-    if (rule.rx.test(padded)) {
-      return { type: rule.type, pattern: rule.pattern, volPct: rule.volPct };
-    }
-  }
-  return { type: "other", pattern: "D-DU-UDU", volPct: 90 };
-}
-
-// Regex hợp âm — cho phép: A, A#, Bb, Cm, F#m, Gmaj7, Asus2, B7, Dm7, Cmaj7, ...
-const CHORD_RX = /\[\s*([A-G][b#]?(?:m|maj|min|sus|dim|aug)?\d*(?:sus[24])?(?:\/[A-G][b#]?)?)\s*\]/g;
-
-// Section header detection — "Verse 1", "ĐK:", "[Chorus]", "Rap:", "Ver 1"
-// Heuristic: dòng ngắn (<=40 ký tự), không chứa hợp âm, kết thúc ":" hoặc match từ khoá
-const SECTION_HEADER_RX = /^\s*(?:\[([^\]]+)\]\s*:?\s*$|([A-Za-zÀ-ỹĐđ][\wÀ-ỹĐđ\s\-_.]*?)\s*:\s*$)/;
-const SECTION_KEYWORDS = /(^|\W)(intro|outro|verse|ver|chorus|đk|điệp\s*khúc|bridge|rap|pre|coda|ending|kết|dạo)(\W|$)/i;
-
-function isSectionHeader(line) {
-  const trimmed = line.trim();
-  if (!trimmed) return null;
-  if (trimmed.length > 60) return null;
-  // Có chứa hợp âm -> không phải header
-  if (CHORD_RX.test(trimmed)) { CHORD_RX.lastIndex = 0; return null; }
-
-  const m = trimmed.match(SECTION_HEADER_RX);
-  if (m) {
-    return (m[1] || m[2] || "").trim();
-  }
-  // Dòng ngắn chứa từ khoá rõ ràng (kể cả không có dấu :)
-  const padded = " " + trimmed.toLowerCase() + " ";
-  if (SECTION_KEYWORDS.test(padded) && trimmed.split(/\s+/).length <= 4) {
-    return trimmed;
-  }
-  return null;
-}
-
-function stripHtml(s) {
-  // Cho phép paste cả HTML — bỏ tag, decode entity cơ bản
-  if (!/<[a-z][\s\S]*>/i.test(s)) return s;
-  const tmp = document.createElement("div");
-  tmp.innerHTML = s;
-  return tmp.textContent || tmp.innerText || "";
-}
-
-function parseSong(rawInput) {
-  const text = stripHtml(rawInput).replace(/\r\n?/g, "\n");
-  const lines = text.split("\n");
-
-  const sections = [];
-  let current = null;
-
-  function flushCurrent() {
-    if (current && (current.chords.length > 0 || current.rawLines.length > 0)) {
-      current.rawText = current.rawLines.join("\n");
-      delete current.rawLines;
-      sections.push(current);
-    }
-  }
-
-  function newSection(name) {
-    flushCurrent();
-    const cls = classifySection(name);
-    current = {
-      name: name,
-      type: cls.type,
-      pattern: cls.pattern,
-      bpm: null,             // null = dùng BPM toàn cục
-      volPct: cls.volPct,
-      chords: [],
-      rawLines: [],
-    };
-  }
-
-  for (const line of lines) {
-    const header = isSectionHeader(line);
-    if (header) {
-      newSection(header);
-      continue;
-    }
-    if (!current) {
-      // Có chord trước cả header -> tạo section ngầm
-      newSection("Untitled");
-    }
-    current.rawLines.push(line);
-
-    let m;
-    CHORD_RX.lastIndex = 0;
-    while ((m = CHORD_RX.exec(line)) !== null) {
-      current.chords.push(m[1]);
-    }
-  }
-  flushCurrent();
-
-  // Bỏ section rỗng (không chord và không text có ý nghĩa)
-  return sections.filter((s) => s.chords.length > 0);
-}
-
-// Map chord raw -> chord nội bộ (xử lý # -> b nếu cần, slash chord dùng phần trước /)
-function normalizeChord(raw) {
-  let c = raw.replace(/\s+/g, "");
-  // Slash chord -> bỏ phần bass, dùng phần đầu
-  c = c.split("/")[0];
-  // "min" -> "m"
-  c = c.replace(/^([A-G][b#]?)min/, "$1m");
-  // Chuyển # sang dạng tương đương b (vì bảng CHORD_SHAPES không có #)
-  // Hoặc giữ nguyên nếu có sẵn — tạm thời thử cả 2
-  if (CHORD_SHAPES[c]) return c;
-  // Thử các phiên bản đơn giản hoá
-  const simplifications = [
-    c,
-    c.replace(/sus\d/, "sus4"),
-    c.replace(/sus\d/, "sus2"),
-    c.replace(/maj\d+/, "maj7"),
-    c.replace(/^([A-G][b#]?)m\d+/, "$1m7"),
-    c.replace(/^([A-G][b#]?)\d+/, "$17"),
-    c.replace(/^([A-G][b#]?).*$/, "$1m"),  // fallback minor
-    c.replace(/^([A-G][b#]?).*$/, "$1"),    // fallback major
-  ];
-  for (const s of simplifications) {
-    if (CHORD_SHAPES[s]) return s;
-  }
-  return null;
-}
-
-// ===========================================================================
-// Render section editor UI
-// ===========================================================================
-const songInput = $("songInput");
-const parseSongBtn = $("parseSongBtn");
-const playSongBtn = $("playSongBtn");
-const downloadSongBtn = $("downloadSongBtn");
-const clearSongBtn = $("clearSongBtn");
-const songStatusEl = $("songStatus");
-const songSectionsEl = $("songSections");
-
-let parsedSong = null;  // { sections: [...] }
-let currentSongSource = null;
-let songHighlightTimers = [];
-
-function setSongStatus(msg, kind) {
-  songStatusEl.textContent = msg || "";
-  songStatusEl.className = "status " + (kind || "");
-}
-
-const PATTERN_OPTIONS = [
-  { v: "D-DU-UDU", t: "Strum: D-DU-UDU (pop)" },
-  { v: "D-D-D-D-", t: "Strum: D-D-D-D-" },
-  { v: "D-DUUDUDU", t: "Strum: D-DUUDUDU" },
-  { v: "D---D---", t: "Strum: D---D--- (chậm)" },
-  { v: "DUDUDUDU", t: "Strum: DUDUDUDU" },
-  { v: "fp:travis", t: "Finger: Travis" },
-  { v: "fp:arpeggio", t: "Finger: Arpeggio" },
-  { v: "fp:ballad", t: "Finger: Ballad" },
-  { v: "fp:waltz", t: "Finger: Waltz 3/4" },
-];
-
-function highlightChordsInLine(line) {
-  // Bọc [Chord] thành <span class="chord">Chord</span>; chord không support -> .bad
-  return line.replace(CHORD_RX, (full, ch) => {
-    const norm = normalizeChord(ch);
-    if (norm) return `<span class="chord">[${ch}]</span>`;
-    return `<span class="chord bad" title="Chưa hỗ trợ">[${ch}]</span>`;
-  });
-}
-
-function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function renderSections() {
-  songSectionsEl.innerHTML = "";
-  if (!parsedSong || parsedSong.sections.length === 0) return;
-
-  parsedSong.sections.forEach((sec, idx) => {
-    const div = document.createElement("div");
-    div.className = "section-row";
-    div.dataset.idx = idx;
-
-    const head = document.createElement("div");
-    head.className = "section-head";
-
-    const nameSpan = document.createElement("span");
-    nameSpan.className = "name";
-    nameSpan.textContent = sec.name + " (" + sec.chords.length + " chord)";
-    head.appendChild(nameSpan);
-
-    // Pattern selector
-    const patSel = document.createElement("select");
-    PATTERN_OPTIONS.forEach((p) => {
-      const opt = document.createElement("option");
-      opt.value = p.v; opt.textContent = p.t;
-      if (p.v === sec.pattern) opt.selected = true;
-      patSel.appendChild(opt);
-    });
-    patSel.addEventListener("change", () => { sec.pattern = patSel.value; });
-    head.appendChild(patSel);
-
-    // BPM override (rỗng = dùng BPM toàn cục)
-    const bpmIn = document.createElement("input");
-    bpmIn.type = "text"; bpmIn.className = "bpm-input";
-    bpmIn.placeholder = "BPM"; bpmIn.value = sec.bpm || "";
-    bpmIn.title = "BPM cho section này (rỗng = theo BPM toàn cục)";
-    bpmIn.addEventListener("change", () => {
-      const v = parseFloat(bpmIn.value);
-      sec.bpm = (isFinite(v) && v >= 30 && v <= 240) ? v : null;
-      if (sec.bpm === null) bpmIn.value = "";
-    });
-    head.appendChild(bpmIn);
-
-    // Vol
-    const volIn = document.createElement("input");
-    volIn.type = "text"; volIn.className = "vol-input";
-    volIn.placeholder = "Vol%"; volIn.value = sec.volPct;
-    volIn.title = "Volume %";
-    volIn.addEventListener("change", () => {
-      const v = parseFloat(volIn.value);
-      sec.volPct = (isFinite(v) && v >= 10 && v <= 150) ? v : 90;
-      volIn.value = sec.volPct;
-    });
-    head.appendChild(volIn);
-
-    div.appendChild(head);
-
-    // Body — hiển thị raw text với chord highlight
-    const body = document.createElement("div");
-    body.className = "section-body";
-    const lines = sec.rawText.split("\n").map(escapeHtml).map(highlightChordsInLine);
-    body.innerHTML = lines.join("\n");
-    div.appendChild(body);
-
-    songSectionsEl.appendChild(div);
-  });
-}
-
-function highlightSection(idx) {
-  document.querySelectorAll(".section-row").forEach((el) => {
-    el.classList.toggle("playing", parseInt(el.dataset.idx, 10) === idx);
-  });
-}
-function clearSongHighlights() {
-  songHighlightTimers.forEach((t) => clearTimeout(t));
-  songHighlightTimers = [];
-  document.querySelectorAll(".section-row").forEach((el) => el.classList.remove("playing"));
-}
-
-// ===========================================================================
-// Render song offline — concat tất cả section, mỗi section có pattern/BPM riêng
-// ===========================================================================
-async function renderSongOffline(song, globalOpts, sampleRate, sampleBank) {
-  const { tone, reverb, engine, beatsPerBar, barsPerChord, bpm: globalBpm } = globalOpts;
-
-  // Tính tổng thời lượng
-  const sectionTimings = song.sections.map((sec) => {
-    const bpm = sec.bpm || globalBpm;
-    const parsed = parsePattern(sec.pattern);
-    const bpb = parsed.beatsPerBar || beatsPerBar;
-    const secPerBeat = 60 / bpm;
-    const secPerChord = secPerBeat * bpb * barsPerChord;
-    return {
-      sec, bpm, parsed, bpb,
-      secPerBeat, secPerChord,
-      duration: secPerChord * sec.chords.length,
-    };
-  });
-
-  const songSec = sectionTimings.reduce((a, t) => a + t.duration, 0);
-  const tailSec = reverb >= 3 ? 3.5 : reverb >= 2 ? 2.5 : reverb >= 1 ? 1.8 : 1.0;
-  const totalSec = songSec + tailSec;
-
-  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  const ctx = new OfflineCtx(2, Math.floor(totalSec * sampleRate), sampleRate);
-
-  // Master chain (giống renderOffline ở trên — duplicate vì OfflineContext riêng)
-  const inputBus = ctx.createGain();
-  inputBus.gain.value = engine === "ks" ? 0.35 : 0.55;
-
-  const hpf = ctx.createBiquadFilter();
-  hpf.type = "highpass"; hpf.frequency.value = engine === "ks" ? 75 : 60; hpf.Q.value = 0.7;
-
-  const eqLow = ctx.createBiquadFilter();
-  eqLow.type = "peaking"; eqLow.frequency.value = 130; eqLow.Q.value = 0.9;
-  const eqMid = ctx.createBiquadFilter();
-  eqMid.type = "peaking"; eqMid.frequency.value = 700; eqMid.Q.value = 0.7;
-  const eqHigh = ctx.createBiquadFilter();
-  eqHigh.type = "peaking"; eqHigh.frequency.value = 4200; eqHigh.Q.value = 0.7;
-
-  if (tone === "warm") {
-    eqLow.gain.value = 3.5; eqMid.gain.value = -2; eqHigh.gain.value = -2;
-  } else if (tone === "bright") {
-    eqLow.gain.value = -1; eqMid.gain.value = -1; eqHigh.gain.value = 4;
-  } else {
-    eqLow.gain.value = engine === "ks" ? 2 : 0;
-    eqMid.gain.value = engine === "ks" ? -2 : 0;
-    eqHigh.gain.value = engine === "ks" ? 2.5 : 0.5;
-  }
-
-  const comp = ctx.createDynamicsCompressor();
-  comp.threshold.value = -16; comp.knee.value = 6; comp.ratio.value = 3;
-  comp.attack.value = 0.003; comp.release.value = 0.12;
-
-  const REVERB_PRESETS = [
-    null,
-    { dur: 1.2, decay: 2.8, pre: 0.012, mix: 0.18 },
-    { dur: 2.0, decay: 2.5, pre: 0.020, mix: 0.28 },
-    { dur: 3.0, decay: 2.2, pre: 0.030, mix: 0.38 },
-  ];
-  const revCfg = REVERB_PRESETS[reverb] || null;
-
-  const dry = ctx.createGain();
-  const wet = ctx.createGain();
-  if (revCfg) {
-    dry.gain.value = 1 - revCfg.mix; wet.gain.value = revCfg.mix * 1.2;
-  } else { dry.gain.value = 1; wet.gain.value = 0; }
-
-  const master = ctx.createGain();
-  master.gain.value = engine === "ks" ? 1.4 : 1.1;
-
-  inputBus.connect(hpf); hpf.connect(eqLow); eqLow.connect(eqMid); eqMid.connect(eqHigh);
-  eqHigh.connect(comp); comp.connect(dry); dry.connect(master);
-  if (revCfg) {
-    const conv = ctx.createConvolver();
-    conv.buffer = makeIR(ctx, revCfg.dur, revCfg.decay, revCfg.pre);
-    comp.connect(conv); conv.connect(wet); wet.connect(master);
-  }
-  master.connect(ctx.destination);
-
-  // Cache 6 panner cố định gắn vào inputBus
-  const panners = createStringPanners(ctx, inputBus);
-
-  // Schedule từng section nối tiếp
-  let sectionStart = 0;
-  for (const t of sectionTimings) {
-    const { sec, parsed, secPerBeat, secPerChord, bpb } = t;
-    const sectionGain = ctx.createGain();
-    sectionGain.gain.value = (sec.volPct / 100);
-    // Nối section gain vào TRƯỚC panners để giữ stereo image; tạo riêng panner cho section.
-    const sectionPanners = createStringPanners(ctx, sectionGain);
-    sectionGain.connect(inputBus);
-
-    // Adaptive note duration theo BPM của section này
-    const noteDurationBass = Math.min(2.6, Math.max(secPerBeat * 4.0, 1.0));
-    const noteDurationTreble = Math.min(2.0, Math.max(secPerBeat * 3.0, 0.8));
-
-    for (let ci = 0; ci < sec.chords.length; ci++) {
-      const chordRaw = sec.chords[ci];
-      const chordName = normalizeChord(chordRaw);
-      if (!chordName) continue;  // bỏ chord không hỗ trợ
-
-      const chordStart = sectionStart + ci * secPerChord;
-      // FIX BUG Ô NHỊP: lặp pattern đủ để phủ hết chord-window
-      const maxBeatInPattern = parsed.events.length
-        ? Math.max(...parsed.events.map((e) => e[0]))
-        : 0;
-      const patternBars = Math.max(1, Math.ceil((maxBeatInPattern + 0.5) / bpb));
-      const patternRepeats = Math.max(1, Math.ceil(barsPerChord / patternBars));
-      const patternSpanBeats = patternBars * bpb;
-
-      for (let rep = 0; rep < patternRepeats; rep++) {
-        const repStart = chordStart + rep * patternSpanBeats * secPerBeat;
-        if (repStart >= chordStart + secPerChord) break;
+      // Lặp pattern qua các bar trong chord — xem comment ở renderOffline
+      const chordBeats = bpb * barsPerChord;
+      const patternBeats = parsed.patternBeats || bpb;
+      const fpJ = parsed.kind === "fp" ? 0.006 : 0.012;
+
+      if (patternBeats >= chordBeats) {
+        // Pattern dài hơn hoặc bằng chord -> chỉ chơi event nằm trong [0, chordBeats)
         for (const ev of parsed.events) {
-          const beatOffset = ev[0];
-          const what = ev[1];
-          const tBeat = repStart + beatOffset * secPerBeat;
-          if (tBeat >= chordStart + secPerChord) continue;
-          const tJitter = (Math.random() - 0.5) * (parsed.kind === "fp" ? 0.006 : 0.012);
+          if (ev[0] >= chordBeats) continue;
+          const tBeat = chordStart + ev[0] * secPerBeat;
+          const tJitter = (Math.random() - 0.5) * fpJ;
           const vel = 0.85 + Math.random() * 0.15;
           if (parsed.kind === "fp") {
-            scheduleFingerpick(ctx, sectionPanners, chordName, tBeat + tJitter, what, vel,
-                               sampleBank, noteDurationBass, noteDurationTreble);
+            scheduleFingerpick(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
           } else {
-            scheduleStrum(ctx, sectionPanners, chordName, tBeat + tJitter, what, vel,
-                          sampleBank, noteDurationBass, noteDurationTreble);
+            scheduleStrum(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+          }
+        }
+      } else {
+        const repeats = Math.max(1, Math.round(chordBeats / patternBeats));
+        for (let rep = 0; rep < repeats; rep++) {
+          const repStart = chordStart + rep * patternBeats * secPerBeat;
+          for (const ev of parsed.events) {
+            const tBeat = repStart + ev[0] * secPerBeat;
+            const tJitter = (Math.random() - 0.5) * fpJ;
+            const vel = 0.85 + Math.random() * 0.15;
+            if (parsed.kind === "fp") {
+              scheduleFingerpick(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+            } else {
+              scheduleStrum(ctx, sectionGain, chordName, tBeat + tJitter, ev[1], vel, sampleBank);
+            }
           }
         }
       }
